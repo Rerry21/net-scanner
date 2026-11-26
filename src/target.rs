@@ -2,6 +2,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 
+use thiserror::Error;
+
 const MAX_TARGETS: u64 = 65_536;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,40 +14,25 @@ pub enum Target {
     Range { start: Ipv4Addr, end: Ipv4Addr },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum TargetError {
+    #[error("target is empty")]
     Empty,
+    #[error("'{0}' is not a valid IP address")]
     InvalidIp(String),
+    #[error("'{0}' is not a valid prefix length (0-32)")]
     InvalidPrefix(String),
+    #[error("'{0}' is not a valid range (example: 192.168.1.10-50)")]
     InvalidRange(String),
+    #[error("'{0}' is not a valid hostname")]
     InvalidHostname(String),
+    #[error("target expands to {0} addresses (limit is 65536)")]
     TooLarge(u64),
+    #[error("could not resolve '{host}': {reason}")]
+    Resolve { host: String, reason: String },
+    #[error("no address found for '{0}'")]
+    NoAddress(String),
 }
-
-impl fmt::Display for TargetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TargetError::Empty => write!(f, "target is empty"),
-            TargetError::InvalidIp(s) => write!(f, "'{s}' is not a valid IP address"),
-            TargetError::InvalidPrefix(s) => {
-                write!(f, "'{s}' is not a valid prefix length (0-32)")
-            }
-            TargetError::InvalidRange(s) => {
-                write!(f, "'{s}' is not a valid range (example: 192.168.1.10-50)")
-            }
-            TargetError::InvalidHostname(s) => write!(f, "'{s}' is not a valid hostname"),
-            TargetError::TooLarge(n) => {
-                write!(
-                    f,
-                    "target expands to {n} addresses (limit is {})",
-                    MAX_TARGETS
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for TargetError {}
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -92,7 +79,7 @@ impl FromStr for Target {
 }
 
 impl Target {
-    pub fn addresses(&self) -> Result<Vec<IpAddr>, String> {
+    pub fn addresses(&self) -> Result<Vec<IpAddr>, TargetError> {
         match self {
             Target::Ip(ip) => Ok(vec![*ip]),
             Target::Host(name) => resolve_host(name),
@@ -165,17 +152,20 @@ fn is_valid_hostname(name: &str) -> bool {
         })
 }
 
-fn resolve_host(name: &str) -> Result<Vec<IpAddr>, String> {
+fn resolve_host(name: &str) -> Result<Vec<IpAddr>, TargetError> {
     let mut ips: Vec<IpAddr> = (name, 0)
         .to_socket_addrs()
-        .map_err(|e| format!("could not resolve '{name}': {e}"))?
+        .map_err(|e| TargetError::Resolve {
+            host: name.to_string(),
+            reason: e.to_string(),
+        })?
         .map(|addr| addr.ip())
         .collect();
 
     ips.dedup();
 
     if ips.is_empty() {
-        Err(format!("no address found for '{name}'"))
+        Err(TargetError::NoAddress(name.to_string()))
     } else {
         Ok(ips)
     }

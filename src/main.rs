@@ -1,12 +1,14 @@
+mod ports;
 mod target;
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream};
-use std::process;
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use ports::PortSpec;
 use target::Target;
 
 #[derive(Parser)]
@@ -22,13 +24,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Check whether a TCP port is open on one or more targets")]
+    #[command(about = "Check which TCP ports are open on one or more targets")]
     Scan {
         #[arg(help = "IP, hostname, CIDR (192.168.1.0/24) or range (192.168.1.10-50)")]
         target: Target,
 
-        #[arg(short, long, default_value_t = 80, help = "Port to check")]
-        port: u16,
+        #[arg(
+            short,
+            long,
+            alias = "port",
+            default_value = "80",
+            help = "Ports: 80 | 22,80,443 | 1-1024 | top100 | all"
+        )]
+        ports: PortSpec,
 
         #[arg(
             short,
@@ -47,35 +55,43 @@ enum PortState {
     Filtered,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    match cli.command {
         Commands::Scan {
             target,
-            port,
+            ports,
             timeout,
-        } => run_scan(&target, port, Duration::from_millis(timeout)),
-    };
-
-    if let Err(message) = result {
-        eprintln!("error: {message}");
-        process::exit(1);
+        } => run_scan(&target, &ports, Duration::from_millis(timeout)),
     }
 }
 
-fn run_scan(target: &Target, port: u16, timeout: Duration) -> Result<(), String> {
+fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration) -> Result<()> {
     let ips = target.addresses()?;
     println!(
-        "Scanning {target} on port {port} ({} address(es))",
-        ips.len()
+        "Scanning {target}: {} address(es), {} port(s)",
+        ips.len(),
+        ports.ports().len()
     );
 
     for ip in ips {
-        let addr = SocketAddr::new(ip, port);
-        let started = Instant::now();
-        let state = check_port(addr, timeout);
-        println!("{addr} -> {state:?} ({} ms)", started.elapsed().as_millis());
+        let (mut open, mut closed, mut filtered) = (0u32, 0u32, 0u32);
+
+        for &port in ports.ports() {
+            let addr = SocketAddr::new(ip, port);
+            let started = Instant::now();
+            match check_port(addr, timeout) {
+                PortState::Open => {
+                    open += 1;
+                    println!("{addr} -> Open ({} ms)", started.elapsed().as_millis());
+                }
+                PortState::Closed => closed += 1,
+                PortState::Filtered => filtered += 1,
+            }
+        }
+
+        println!("{ip}: {open} open, {closed} closed, {filtered} filtered");
     }
     Ok(())
 }
