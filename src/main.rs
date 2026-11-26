@@ -1,9 +1,13 @@
+mod target;
+
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::process;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+
+use target::Target;
 
 #[derive(Parser)]
 #[command(
@@ -18,10 +22,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Check whether a TCP port is open on a target host")]
+    #[command(about = "Check whether a TCP port is open on one or more targets")]
     Scan {
-        #[arg(help = "Hostname or IP address to scan")]
-        target: String,
+        #[arg(help = "IP, hostname, CIDR (192.168.1.0/24) or range (192.168.1.10-50)")]
+        target: Target,
 
         #[arg(short, long, default_value_t = 80, help = "Port to check")]
         port: u16,
@@ -60,23 +64,20 @@ fn main() {
     }
 }
 
-fn run_scan(target: &str, port: u16, timeout: Duration) -> Result<(), String> {
-    let addr = resolve(target, port)?;
+fn run_scan(target: &Target, port: u16, timeout: Duration) -> Result<(), String> {
+    let ips = target.addresses()?;
+    println!(
+        "Scanning {target} on port {port} ({} address(es))",
+        ips.len()
+    );
 
-    let started = Instant::now();
-    let state = check_port(addr, timeout);
-    let elapsed = started.elapsed();
-
-    println!("{addr} -> {state:?} ({} ms)", elapsed.as_millis());
+    for ip in ips {
+        let addr = SocketAddr::new(ip, port);
+        let started = Instant::now();
+        let state = check_port(addr, timeout);
+        println!("{addr} -> {state:?} ({} ms)", started.elapsed().as_millis());
+    }
     Ok(())
-}
-
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve '{host}': {e}"))?
-        .next()
-        .ok_or_else(|| format!("no address found for '{host}'"))
 }
 
 fn check_port(addr: SocketAddr, timeout: Duration) -> PortState {
