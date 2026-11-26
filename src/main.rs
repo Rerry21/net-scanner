@@ -1,14 +1,15 @@
 mod ports;
+mod scanner;
 mod target;
 
-use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpStream};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use ports::PortSpec;
+use scanner::{PortResult, PortState};
 use target::Target;
 
 #[derive(Parser)]
@@ -45,14 +46,10 @@ enum Commands {
             help = "Connection timeout in milliseconds"
         )]
         timeout: u64,
-    },
-}
 
-#[derive(Debug)]
-enum PortState {
-    Open,
-    Closed,
-    Filtered,
+        #[arg(short, long, help = "Also list closed and filtered ports")]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -63,11 +60,12 @@ fn main() -> Result<()> {
             target,
             ports,
             timeout,
-        } => run_scan(&target, &ports, Duration::from_millis(timeout)),
+            verbose,
+        } => run_scan(&target, &ports, Duration::from_millis(timeout), verbose),
     }
 }
 
-fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration) -> Result<()> {
+fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration, verbose: bool) -> Result<()> {
     let ips = target.addresses()?;
     println!(
         "Scanning {target}: {} address(es), {} port(s)",
@@ -75,31 +73,39 @@ fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration) -> Result<()> 
         ports.ports().len()
     );
 
+    let started = Instant::now();
+
     for ip in ips {
-        let (mut open, mut closed, mut filtered) = (0u32, 0u32, 0u32);
-
-        for &port in ports.ports() {
-            let addr = SocketAddr::new(ip, port);
-            let started = Instant::now();
-            match check_port(addr, timeout) {
-                PortState::Open => {
-                    open += 1;
-                    println!("{addr} -> Open ({} ms)", started.elapsed().as_millis());
-                }
-                PortState::Closed => closed += 1,
-                PortState::Filtered => filtered += 1,
-            }
-        }
-
-        println!("{ip}: {open} open, {closed} closed, {filtered} filtered");
+        let results = scanner::scan_host(ip, ports.ports(), timeout);
+        print_report(ip, &results, verbose);
     }
+
+    println!("\nScan finished in {:.2} s", started.elapsed().as_secs_f64());
     Ok(())
 }
 
-fn check_port(addr: SocketAddr, timeout: Duration) -> PortState {
-    match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(_) => PortState::Open,
-        Err(e) if e.kind() == ErrorKind::ConnectionRefused => PortState::Closed,
-        Err(_) => PortState::Filtered,
+fn print_report(ip: IpAddr, results: &[PortResult], verbose: bool) {
+    println!("\nHost {ip}");
+    println!("{:<7} {:<9} {:<24} {:>8}", "PORT", "STATE", "REASON", "TIME");
+
+    for result in results
+        .iter()
+        .filter(|r| verbose || r.state == PortState::Open)
+    {
+        println!(
+            "{:<7} {:<9} {:<24} {:>5} ms",
+            result.addr.port(),
+            result.state,
+            result.reason,
+            result.elapsed.as_millis()
+        );
     }
+
+    let count = |state: PortState| results.iter().filter(|r| r.state == state).count();
+    println!(
+        "{} open, {} closed, {} filtered",
+        count(PortState::Open),
+        count(PortState::Closed),
+        count(PortState::Filtered)
+    );
 }

@@ -21,7 +21,7 @@ pub enum PortSpecError {
     Empty,
     #[error("'{0}' is not a valid port (1-65535)")]
     InvalidPort(String),
-    #[error("port 0 is nor scannable (use 1-65535)")]
+    #[error("port 0 is not scannable (use 1-65535)")]
     ZeroPort,
     #[error("range {start}-{end} is backwards (start must not exceed end)")]
     ReversedRange { start: u16, end: u16},
