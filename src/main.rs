@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use ports::PortSpec;
-use scanner::{PortResult, PortState};
+use scanner::{PortResult, PortState, ScanConfig};
 use target::Target;
 
 #[derive(Parser)]
@@ -47,6 +47,14 @@ enum Commands {
         )]
         timeout: u64,
 
+        #[arg(
+            short,
+            long,
+            default_value_t = 0,
+            help = "Retry count for filtered ports"
+        )]
+        retries: u32,
+
         #[arg(short, long, help = "Also list closed and filtered ports")]
         verbose: bool,
     },
@@ -60,12 +68,19 @@ fn main() -> Result<()> {
             target,
             ports,
             timeout,
+            retries,
             verbose,
-        } => run_scan(&target, &ports, Duration::from_millis(timeout), verbose),
+        } => run_scan(&target, &ports, Duration::from_millis(timeout), retries, verbose),
     }
 }
 
-fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration, verbose: bool) -> Result<()> {
+fn run_scan(
+    target: &Target,
+    ports: &PortSpec,
+    timeout: Duration,
+    retries: u32,
+    verbose: bool,
+) -> Result<()> {
     let ips = target.addresses()?;
     println!(
         "Scanning {target}: {} address(es), {} port(s)",
@@ -76,7 +91,7 @@ fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration, verbose: bool)
     let started = Instant::now();
 
     for ip in ips {
-        let results = scanner::scan_host(ip, ports.ports(), timeout);
+        let results = scanner::scan_host(ip, ports.ports(), ScanConfig { timeout, retries });
         print_report(ip, &results, verbose);
     }
 
@@ -84,20 +99,28 @@ fn run_scan(target: &Target, ports: &PortSpec, timeout: Duration, verbose: bool)
     Ok(())
 }
 
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 fn print_report(ip: IpAddr, results: &[PortResult], verbose: bool) {
     println!("\nHost {ip}");
-    println!("{:<7} {:<9} {:<24} {:>8}", "PORT", "STATE", "REASON", "TIME");
+    println!(
+        "{:<7} {:<9} {:<24} {:>5} {:>10}",
+        "PORT", "STATE", "REASON", "TRIES", "TIME"
+    );
 
     for result in results
         .iter()
         .filter(|r| verbose || r.state == PortState::Open)
     {
         println!(
-            "{:<7} {:<9} {:<24} {:>5} ms",
+            "{:<7} {:<9} {:<24} {:>5} {:>7.1} ms",
             result.addr.port(),
             result.state,
             result.reason,
-            result.elapsed.as_millis()
+            result.attempts,
+            ms(result.elapsed)
         );
     }
 
@@ -108,4 +131,13 @@ fn print_report(ip: IpAddr, results: &[PortResult], verbose: bool) {
         count(PortState::Closed),
         count(PortState::Filtered)
     );
+
+    if let Some(latency) = scanner::open_latency(results) {
+        println!(
+            "Open-port latency: min {:.1} ms, avg {:.1} ms, max {:.1} ms",
+            ms(latency.min),
+            ms(latency.avg),
+            ms(latency.max)
+        );
+    }
 }
