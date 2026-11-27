@@ -50,10 +50,19 @@ enum Commands {
         #[arg(
             short,
             long,
-            default_value_t = 0,
-            help = "Retry count for filtered ports"
+            default_value_t = 1,
+            help = "Extra attempts for ports that time out"
         )]
         retries: u32,
+
+        #[arg(
+            short = 'j',
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u16).range(1..=512),
+            help = "Parallel worker threads (1-512)"
+        )]
+        threads: u16,
 
         #[arg(short, long, help = "Also list closed and filtered ports")]
         verbose: bool,
@@ -69,29 +78,32 @@ fn main() -> Result<()> {
             ports,
             timeout,
             retries,
+            threads,
             verbose,
-        } => run_scan(&target, &ports, Duration::from_millis(timeout), retries, verbose),
+        } => {
+            let config = ScanConfig {
+                timeout: Duration::from_millis(timeout),
+                retries,
+                threads: usize::from(threads),
+            };
+            run_scan(&target, &ports, config, verbose)
+        }
     }
 }
 
-fn run_scan(
-    target: &Target,
-    ports: &PortSpec,
-    timeout: Duration,
-    retries: u32,
-    verbose: bool,
-) -> Result<()> {
+fn run_scan(target: &Target, ports: &PortSpec, config: ScanConfig, verbose: bool) -> Result<()> {
     let ips = target.addresses()?;
     println!(
-        "Scanning {target}: {} address(es), {} port(s)",
+        "Scanning {target}: {} address(es), {} port(s), {} thread(s)",
         ips.len(),
-        ports.ports().len()
+        ports.ports().len(),
+        config.threads
     );
 
     let started = Instant::now();
 
     for ip in ips {
-        let results = scanner::scan_host(ip, ports.ports(), ScanConfig { timeout, retries });
+        let results = scanner::scan_host(ip, ports.ports(), config);
         print_report(ip, &results, verbose);
     }
 
