@@ -56,20 +56,23 @@ enum Commands {
         retries: u32,
 
         #[arg(
-            short = 'j',
+            short = 'c',
             long,
+            alias = "threads",
+            short_alias = 'j',
             default_value_t = 1,
-            value_parser = clap::value_parser!(u16).range(1..=512),
-            help = "Parallel worker threads (1-512)"
+            value_parser = clap::value_parser!(u16).range(1..=5000),
+            help = "Concurrent connections (1-5000)"
         )]
-        threads: u16,
+        concurrency: u16,
 
         #[arg(short, long, help = "Also list closed and filtered ports")]
         verbose: bool,
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -78,32 +81,37 @@ fn main() -> Result<()> {
             ports,
             timeout,
             retries,
-            threads,
+            concurrency,
             verbose,
         } => {
             let config = ScanConfig {
                 timeout: Duration::from_millis(timeout),
                 retries,
-                threads: usize::from(threads),
+                concurrency: usize::from(concurrency),
             };
-            run_scan(&target, &ports, config, verbose)
+            run_scan(&target, &ports, config, verbose).await
         }
     }
 }
 
-fn run_scan(target: &Target, ports: &PortSpec, config: ScanConfig, verbose: bool) -> Result<()> {
+async fn run_scan(
+    target: &Target,
+    ports: &PortSpec,
+    config: ScanConfig,
+    verbose: bool,
+) -> Result<()> {
     let ips = target.addresses()?;
     println!(
-        "Scanning {target}: {} address(es), {} port(s), {} thread(s)",
+        "Scanning {target}: {} address(es), {} port(s), concurrency {}",
         ips.len(),
         ports.ports().len(),
-        config.threads
+        config.concurrency
     );
 
     let started = Instant::now();
 
     for ip in ips {
-        let results = scanner::scan_host(ip, ports.ports(), config);
+        let results = scanner::scan_host(ip, ports.ports(), config).await;
         print_report(ip, &results, verbose);
     }
 

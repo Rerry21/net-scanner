@@ -1,17 +1,16 @@
 use std::fmt;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use futures::stream::{self, StreamExt};
+use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScanConfig {
     pub timeout: Duration,
     pub retries: u32,
-    pub threads: usize,
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,42 +47,25 @@ pub struct Latency {
     pub max: Duration,
 }
 
-pub fn scan_host(ip: IpAddr, ports: &[u16], config: ScanConfig) -> Vec<PortResult> {
-    let workers = config.threads.clamp(1, ports.len().max(1));
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel();
+pub async fn scan_host(ip: IpAddr, ports: &[u16], config: ScanConfig) -> Vec<PortResult> {
+    let mut results: Vec<PortResult> = stream::iter(ports.iter().copied())
+        .map(|port| scan_port(SocketAddr::new(ip, port), config))
+        .buffer_unordered(config.concurrency.max(1))
+        .collect()
+        .await;
 
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let next = &next;
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(&port) = ports.get(index) else {
-                    break;
-                };
-                let result = scan_port(SocketAddr::new(ip, port), config);
-                if tx.send(result).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(tx);
-    });
-
-    let mut results: Vec<PortResult> = rx.into_iter().collect();
     results.sort_by_key(|r| r.addr.port());
     results
 }
 
-pub fn scan_port(addr: SocketAddr, config: ScanConfig) -> PortResult {
+pub async fn scan_port(addr: SocketAddr, config: ScanConfig) -> PortResult {
     let mut attempts = 0;
 
     let (state, reason, elapsed) = loop {
         attempts += 1;
 
         let started = Instant::now();
-        let (state, reason) = attempt(addr, config.timeout);
+        let (state, reason) = attempt(addr, config.timeout).await;
         let elapsed = started.elapsed();
 
         if state != PortState::Filtered || attempts > config.retries {
@@ -117,10 +99,11 @@ pub fn open_latency(results: &[PortResult]) -> Option<Latency> {
     })
 }
 
-fn attempt(addr: SocketAddr, timeout: Duration) -> (PortState, &'static str) {
-    match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(_) => (PortState::Open, "connected"),
-        Err(error) => classify(&error),
+async fn attempt(addr: SocketAddr, limit: Duration) -> (PortState, &'static str) {
+    match tokio::time::timeout(limit, TcpStream::connect(addr)).await {
+        Ok(Ok(_stream)) => (PortState::Open, "connected"),
+        Ok(Err(error)) => classify(&error),
+        Err(_elapsed) => (PortState::Filtered, "no response (timeout)"),
     }
 }
 
@@ -146,7 +129,7 @@ mod tests {
         ScanConfig {
             timeout: Duration::from_secs(2),
             retries,
-            threads: 1,
+            concurrency: 1,
         }
     }
 
@@ -160,24 +143,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn open_port_is_detected() {
+    #[tokio::test]
+    async fn open_port_is_detected() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let result = scan_port(addr, config(0));
+        let result = scan_port(addr, config(0)).await;
 
         assert_eq!(result.state, PortState::Open);
         assert_eq!(result.reason, "connected");
         assert_eq!(result.attempts, 1);
     }
 
-    #[test]
-    fn open_port_is_not_retried() {
+    #[tokio::test]
+    async fn open_port_is_not_retried() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let result = scan_port(addr, config(3));
+        let result = scan_port(addr, config(3)).await;
 
         assert_eq!(result.state, PortState::Open);
         assert_eq!(result.attempts, 1);
@@ -195,54 +178,54 @@ mod tests {
         assert_eq!(classify(&other).0, PortState::Filtered);
     }
 
-    #[test]
-    fn scan_host_returns_one_result_per_port() {
+    #[tokio::test]
+    async fn scan_host_returns_one_result_per_port() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-        let results = scan_host(ip, &[port], config(0));
+        let results = scan_host(ip, &[port], config(0)).await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].addr.port(), port);
     }
 
-    #[test]
-    fn parallel_scan_returns_sorted_results() {
+    #[tokio::test]
+    async fn concurrent_scan_returns_sorted_results() {
         let listeners: Vec<TcpListener> = (0..4)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
         let mut ports: Vec<u16> = listeners
             .iter()
-            .map(|listener| listener.local_addr().unwrap().port())
+            .map(|l| l.local_addr().unwrap().port())
             .collect();
         ports.sort_unstable();
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let parallel = ScanConfig {
-            threads: 4,
+        let concurrent = ScanConfig {
+            concurrency: 4,
             ..config(0)
         };
 
-        let results = scan_host(ip, &ports, parallel);
+        let results = scan_host(ip, &ports, concurrent).await;
 
         let scanned: Vec<u16> = results.iter().map(|r| r.addr.port()).collect();
         assert_eq!(scanned, ports);
         assert!(results.iter().all(|r| r.state == PortState::Open));
     }
 
-    #[test]
-    fn more_threads_than_ports_and_empty_list() {
+    #[tokio::test]
+    async fn more_concurrency_than_ports_and_empty_list() {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let many = ScanConfig {
-            threads: 64,
+            concurrency: 64,
             ..config(0)
         };
 
-        assert!(scan_host(ip, &[], many).is_empty());
+        assert!(scan_host(ip, &[], many).await.is_empty());
 
-        let listener = TcpListener::bind("127.0.0.1:10").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert_eq!(scan_host(ip, &[port], many).len(), 1);
+        assert_eq!(scan_host(ip, &[port], many).await.len(), 1);
     }
 
     #[test]
